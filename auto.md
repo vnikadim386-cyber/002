@@ -5,9 +5,11 @@
  */
 
 const SHEET_NAME = 'Журнал';
+const REF_SHEET_NAME = 'Справочники';   // A = операции, B = места
 const HEADER_ROW = 1;
 const PURCHASE_MILEAGE = 202909;          // пробег при покупке
 const PURCHASE_DATE = '2025-09-20';       // дата покупки
+const DEFAULT_OPERATIONS = ['топливо', 'мойка', 'запчасти', 'расходники', 'услуги', 'ремонт', 'покупка авто', '-'];
 
 // ==================== МЕНЮ ====================
 function onOpen() {
@@ -73,10 +75,10 @@ function getLastFuelPrice() {
 
 function getDropdownData() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  let operations = ['топливо', 'мойка', 'запчасти', 'расходники', 'услуги', 'ремонт', 'покупка авто', '-'];
+  let operations = DEFAULT_OPERATIONS.slice();
   let places = [];
 
-  const ref = ss.getSheetByName('Справочники');
+  const ref = ss.getSheetByName(REF_SHEET_NAME);
   if (ref) {
     const ops = ref.getRange('A2:A').getValues().flat().filter(String);
     const pls = ref.getRange('B2:B').getValues().flat().filter(String);
@@ -84,13 +86,7 @@ function getDropdownData() {
     if (pls.length) places = pls;
   }
 
-  if (!places.length) {
-    const sheet = getSheet_();
-    if (sheet && sheet.getLastRow() > HEADER_ROW) {
-      const vals = sheet.getRange(HEADER_ROW + 1, 2, sheet.getLastRow() - HEADER_ROW, 1).getValues().flat().filter(String);
-      places = [...new Set(vals)].sort();
-    }
-  }
+  if (!places.length) places = getJournalPlaces_();
 
   return {
     operations,
@@ -110,16 +106,22 @@ function addRecord(data) {
   const qty = parseFloat(String(data.qty).replace(',', '.')) || 0;
   const sum = Math.round(price * qty * 100) / 100;
   const mileage = parseFloat(String(data.mileage).replace(',', '.')) || 0;
-  const operation = (data.operation || '').trim();
+  let operation = (data.operation || '').trim();
+  let place = (data.place || '').trim();
 
-  // Если операции ещё нет в справочнике — добавляем
-  if (operation) {
-    addToReference_('operations', operation);
+  // Новые операция / место попадают в лист "Справочники" (если такого значения там ещё нет).
+  // Возвращается написание, которое уже есть в справочнике (без учёта регистра).
+  // Ошибка справочника не должна мешать сохранить запись.
+  try {
+    operation = addToReference_('operations', operation);
+    place = addToReference_('places', place);
+  } catch (err) {
+    Logger.log('addToReference_ failed: ' + err.message);
   }
 
   sheet.appendRow([
     date,
-    data.place || '',
+    place,
     operation,
     price,
     qty,
@@ -140,7 +142,8 @@ function addRecord(data) {
     sum,
     lastMileage: mileage,
     lastFuelPrice: operation === 'топливо' ? price : getLastFuelPrice(),
-    newOperation: operation
+    newOperation: operation,
+    newPlace: place
   };
 }
 
@@ -259,25 +262,60 @@ function getReglament() {
 }
 
 // ==================== HELPERS ====================
+/**
+ * Добавляет значение в лист "Справочники" (type: 'operations' -> столбец A, 'places' -> столбец B).
+ * Если такое значение уже есть (без учёта регистра) — ничего не пишет и возвращает написание из справочника.
+ * Если лист или столбец пустой — сначала заполняет его тем, что приложение показывает сейчас
+ * (операции по умолчанию / места из журнала), чтобы одно новое значение не скрыло остальные.
+ */
 function addToReference_(type, value) {
-  if (!value) return;
+  value = String(value || '').trim();
+  if (!value) return value;
+
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  let ref = ss.getSheetByName('Справочники');
+  let ref = ss.getSheetByName(REF_SHEET_NAME);
   if (!ref) {
-    ref = ss.insertSheet('Справочники');
+    ref = ss.insertSheet(REF_SHEET_NAME);
     ref.getRange('A1').setValue('операция');
     ref.getRange('B1').setValue('место');
   }
 
   const col = type === 'operations' ? 1 : 2; // A = операции, B = места
-  const last = ref.getLastRow();
-  const existing = last > 1
-    ? ref.getRange(2, col, last - 1, 1).getValues().flat().map(String)
-    : [];
 
-  if (!existing.includes(value)) {
-    ref.getRange(last + 1, col).setValue(value);
+  let vals = readRefColumn_(ref, col);
+  if (!vals.some(Boolean)) {
+    const seed = type === 'operations' ? DEFAULT_OPERATIONS.slice() : getJournalPlaces_();
+    if (seed.length) {
+      if (seed.length + 1 > ref.getMaxRows()) ref.insertRowsAfter(ref.getMaxRows(), seed.length);
+      ref.getRange(2, col, seed.length, 1).setValues(seed.map(v => [v]));
+      vals = readRefColumn_(ref, col);
+    }
   }
+
+  const lower = value.toLowerCase();
+  const found = vals.find(v => v && v.toLowerCase() === lower);
+  if (found) return found;
+
+  let lastIdx = -1;
+  vals.forEach((v, i) => { if (v) lastIdx = i; });
+  const row = lastIdx + 3; // vals[0] лежит в строке 2
+  if (row > ref.getMaxRows()) ref.insertRowsAfter(ref.getMaxRows(), 10);
+  ref.getRange(row, col).setValue(value);
+  return value;
+}
+
+// Значения столбца справочника (со строки 2, включая пустые ячейки), как строки
+function readRefColumn_(ref, col) {
+  const n = Math.max(1, ref.getMaxRows() - 1);
+  return ref.getRange(2, col, n, 1).getValues().map(r => String(r[0]).trim());
+}
+
+// Уникальные места из журнала (столбец B), по алфавиту
+function getJournalPlaces_() {
+  const sheet = getSheet_();
+  if (!sheet || sheet.getLastRow() <= HEADER_ROW) return [];
+  const vals = sheet.getRange(HEADER_ROW + 1, 2, sheet.getLastRow() - HEADER_ROW, 1).getValues().flat().filter(String);
+  return [...new Set(vals.map(v => String(v).trim()).filter(Boolean))].sort();
 }
 
 function getSheet_() {
@@ -525,17 +563,28 @@ function getAppHtml(isSidebar) {
     // ---- init ----
     google.script.run.withSuccessHandler(initForm).withFailureHandler(e => showStatus(e.message, false)).getDropdownData();
 
+    // Добавляет <option> в datalist, если такого значения там ещё нет (без учёта регистра)
+    function addListOption(listId, value) {
+      if (!value) return;
+      const list = document.getElementById(listId);
+      const low = String(value).toLowerCase();
+      const exists = Array.from(list.options).some(o => o.value.toLowerCase() === low);
+      if (exists) return;
+      const o = document.createElement('option');
+      o.value = value;
+      list.appendChild(o);
+    }
+
     function initForm(data) {
       lastMileage = data.lastMileage || 0;
       lastFuelPrice = data.lastFuelPrice || 0;
       document.getElementById('date').value = data.today;
       document.getElementById('mileage').value = lastMileage;
 
-      const opSelect = document.getElementById('operation');
+      const opInput = document.getElementById('operation');
       const quick = document.getElementById('quickOps');
       data.operations.forEach(op => {
-        const o = document.createElement('option');
-        o.value = op; o.textContent = op; opSelect.appendChild(o);
+        addListOption('operationsList', op);
         if (['топливо','мойка','запчасти','услуги','расходники'].includes(op)) {
           const b = document.createElement('button');
           b.type = 'button'; b.textContent = op;
@@ -544,17 +593,18 @@ function getAppHtml(isSidebar) {
           quick.appendChild(b);
         }
       });
-      opSelect.value = 'топливо';
+      opInput.value = 'топливо';
+      currentOp = 'топливо';
       applyFuelPrice();
 
-      data.places.forEach(p => {
-        const o = document.createElement('option'); o.value = p;
-        document.getElementById('placesList').appendChild(o);
-      });
+      data.places.forEach(p => addListOption('placesList', p));
 
       document.getElementById('price').addEventListener('input', calcSum);
       document.getElementById('qty').addEventListener('input', calcSum);
-      opSelect.addEventListener('change', () => { currentOp = opSelect.value; updateQuick(); onOpChange(); });
+      // поле можно выбрать из списка или вписать своё значение
+      opInput.addEventListener('focus', () => opInput.select());
+      opInput.addEventListener('change', () => { currentOp = opInput.value.trim(); updateQuick(); onOpChange(); });
+      opInput.addEventListener('input', () => { currentOp = opInput.value.trim(); updateQuick(); });
     }
 
     function selectOp(op) {
@@ -564,7 +614,8 @@ function getAppHtml(isSidebar) {
       onOpChange();
     }
     function updateQuick() {
-      document.querySelectorAll('.quick-ops button').forEach(b => b.classList.toggle('active', b.textContent === currentOp));
+      const val = document.getElementById('operation').value.trim();
+      document.querySelectorAll('.quick-ops button').forEach(b => b.classList.toggle('active', b.textContent === val));
     }
     function onOpChange() {
       if (currentOp === 'топливо') applyFuelPrice();
@@ -592,7 +643,7 @@ function getAppHtml(isSidebar) {
       const data = {
         date: document.getElementById('date').value,
         place: document.getElementById('place').value.trim(),
-        operation: document.getElementById('operation').value,
+        operation: document.getElementById('operation').value.trim(),
         price: document.getElementById('price').value,
         qty: document.getElementById('qty').value,
         mileage: document.getElementById('mileage').value,
@@ -602,6 +653,9 @@ function getAppHtml(isSidebar) {
         showStatus('✓ ' + res.message + ' · ' + res.sum + ' ₽', true);
         lastMileage = res.lastMileage;
         if (res.lastFuelPrice) lastFuelPrice = res.lastFuelPrice;
+        // новые значения сразу появляются в подсказках (в справочнике они уже сохранены)
+        addListOption('operationsList', res.newOperation);
+        addListOption('placesList', res.newPlace);
         document.getElementById('place').value = '';
         document.getElementById('qty').value = '';
         document.getElementById('comment').value = '';
